@@ -1,0 +1,175 @@
+#include <opencv2/opencv.hpp>
+#include <opencv2/dnn.hpp> // Kita masih perlu ini untuk NMS
+#include <onnxruntime_cxx_api.h> // Header ONNX Runtime
+#include <iostream>
+#include <vector>
+
+using namespace cv;
+using namespace std;
+using namespace Ort;
+
+// --- PERHATIKAN: PRE-PROCESSING BERBEDA ---
+// ONNX Runtime perlu input [batch, channel, height, width]
+// Berbeda dari blobFromImage OpenCV
+void preprocess(const Mat& img, float* blob_data, const int& input_height, const int& input_width) {
+    // 1. Resize gambar
+    Mat resized_img;
+    resize(img, resized_img, Size(input_width, input_height), 0, 0, INTER_LINEAR);
+
+    // 2. Konversi HWC (Height, Width, Channel) ke CHW (Channel, Height, Width)
+    //    dan normalisasi (bagi 255)
+    for (int c = 0; c < 3; ++c) { // Loop per channel (B, G, R)
+        for (int h = 0; h < input_height; ++h) {
+            for (int w = 0; w < input_width; ++w) {
+                // Lokasi pixel di gambar HWC
+                Vec3b pixel = resized_img.at<Vec3b>(h, w);
+                
+                // Lokasi data di blob CHW
+                // blob_data[channel][height][width]
+                int chw_index = c * (input_height * input_width) + h * input_width + w;
+
+                // Normalisasi dan simpan
+                blob_data[chw_index] = (float)pixel[c] / 255.0f;
+            }
+        }
+    }
+}
+
+int main() {
+    // ---- 1. INISIALISASI ONNX RUNTIME ----
+    Env env(ORT_LOGGING_LEVEL_WARNING, "YOLOv8_ORT_Test");
+    SessionOptions session_options;
+    
+    // Aktifkan CUDA (jika Anda punya GPU NVIDIA dan ORT versi GPU)
+    // OrtCUDAProviderOptions cuda_options{};
+    // session_options.AppendExecutionProvider_CUDA(cuda_options);
+
+    // Ganti dengan path ke model .onnx Anda
+    const char* model_path = "yolov8n.onnx";
+    
+    Session session(env, model_path, session_options);
+
+    // ---- 2. DAPATKAN INFO INPUT & OUTPUT ----
+    AllocatorWithDefaultOptions allocator;
+
+    // Info Input
+    size_t num_input_nodes = session.GetInputCount();
+    const char* input_name = session.GetInputName(0, allocator);
+    auto input_type_info = session.GetInputTypeInfo(0);
+    auto input_tensor_info = input_type_info.GetTensorTypeAndShapeInfo();
+    auto input_shape = input_tensor_info.GetShape(); // [batch, channel, height, width]
+
+    const int input_batch = input_shape[0]; // Harusnya 1
+    const int input_channels = input_shape[1]; // Harusnya 3
+    const int input_height = input_shape[2]; // Harusnya 640
+    const int input_width = input_shape[3]; // Harusnya 640
+    
+    // Info Output
+    const char* output_name = session.GetOutputName(0, allocator);
+    auto output_type_info = session.GetOutputTypeInfo(0);
+    auto output_tensor_info = output_type_info.GetTensorTypeAndShapeInfo();
+    auto output_shape = output_tensor_info.GetShape(); // [1, 84, 8400]
+
+    const int num_classes_with_box = output_shape[1]; // 84 (4 box + 80 class)
+    const int num_detections = output_shape[2]; // 8400
+
+    cout << "Model Input: " << input_name << " Shape: [1, " << input_channels << ", " << input_height << ", " << input_width << "]" << endl;
+    cout << "Model Output: " << output_name << " Shape: [1, " << num_classes_with_box << ", " << num_detections << "]" << endl;
+
+    // ---- 3. MEMUAT GAMBAR (Gunakan OpenCV) ----
+    Mat frame = imread("gambar.jpg");
+    if (frame.empty()) {
+        cerr << "Error: Tidak bisa membuka gambar!" << endl;
+        return -1;
+    }
+    float scale_x = (float)frame.cols / input_width;
+    float scale_y = (float)frame.rows / input_height;
+
+    // ---- 4. PRE-PROCESSING (Sangat Penting!) ----
+    // Siapkan memori untuk input blob
+    size_t input_tensor_size = 1 * input_channels * input_height * input_width;
+    vector<float> input_tensor_values(input_tensor_size);
+
+    // Panggil fungsi preprocess
+    preprocess(frame, input_tensor_values.data(), input_height, input_width);
+
+    // ---- 5. BUAT INPUT TENSOR ----
+    vector<const char*> input_node_names = {input_name};
+    vector<const char*> output_node_names = {output_name};
+    
+    MemoryInfo memory_info = MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+    Value input_tensor = Value::CreateTensor<float>(memory_info, 
+                                                    input_tensor_values.data(), input_tensor_size, 
+                                                    input_shape.data(), input_shape.size());
+
+    // ---- 6. JALANKAN INFERENCE ----
+    cout << "Menjalankan inference..." << endl;
+    auto output_tensors = session.Run(RunOptions{nullptr}, 
+                                      input_node_names.data(), &input_tensor, 1, 
+                                      output_node_names.data(), 1);
+    cout << "Inference selesai." << endl;
+
+    // ---- 7. POST-PROCESSING (Mengurai Hasil) ----
+    // Dapatkan pointer ke data output
+    float* output_data = output_tensors[0].GetTensorMutableData<float>();
+
+    // Transpose output dari [1, 84, 8400] ke [1, 8400, 84] agar lebih mudah diurai
+    Mat output_mat(num_classes_with_box, num_detections, CV_32F, output_data);
+    output_mat = output_mat.t(); // Transpose
+
+    vector<Rect> boxes;
+    vector<float> confidences;
+    vector<int> class_ids;
+
+    float conf_threshold = 0.25;
+    float nms_threshold = 0.45;
+
+    for (int i = 0; i < output_mat.rows; i++) {
+        Mat detection = output_mat.row(i);
+        
+        Mat classes_scores = detection.colRange(4, num_classes_with_box);
+        Point class_id_point;
+        double max_class_score;
+        minMaxLoc(classes_scores, 0, &max_class_score, 0, &class_id_point);
+
+        if (max_class_score > conf_threshold) {
+            float confidence = max_class_score;
+            int class_id = class_id_point.x;
+            
+            // Dapatkan koordinat kotak (cx, cy, w, h)
+            float cx = detection.at<float>(0, 0);
+            float cy = detection.at<float>(0, 1);
+            float w = detection.at<float>(0, 2);
+            float h = detection.at<float>(0, 3);
+
+            // Konversi ke (x, y) pojok kiri atas
+            int left = (int)((cx - 0.5 * w) * scale_x);
+            int top = (int)((cy - 0.5 * h) * scale_y);
+            int width = (int)(w * scale_x);
+            int height = (int)(h * scale_y);
+
+            boxes.push_back(Rect(left, top, width, height));
+            confidences.push_back(confidence);
+            class_ids.push_back(class_id);
+        }
+    }
+
+    // Terapkan Non-Maximum Suppression (Gunakan fungsi NMS dari OpenCV)
+    vector<int> indices;
+    dnn::NMSBoxes(boxes, confidences, conf_threshold, nms_threshold, indices);
+
+    // ---- 8. GAMBAR HASIL (Gunakan OpenCV) ----
+    for (int idx : indices) {
+        Rect box = boxes[idx];
+        rectangle(frame, box, Scalar(0, 255, 0), 2);
+        
+        string label = "Class " + to_string(class_ids[idx]) + ": " + format("%.2f", confidences[idx]);
+        cout << "Deteksi: " << label << " di " << box << endl;
+        putText(frame, label, Point(box.x, box.y - 10), FONT_HERSHEY_SIMPLEX, 0.5, Scalar(0, 255, 0), 2);
+    }
+
+    imwrite("hasil_deteksi_onnx.jpg", frame);
+    cout << "Gambar hasil disimpan di 'hasil_deteksi_onnx.jpg'" << endl;
+
+    return 0;
+}
